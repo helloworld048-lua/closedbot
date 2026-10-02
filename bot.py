@@ -18,6 +18,10 @@ from aiogram.types import (
     Message,
 )
 
+# =========================================================
+# CONFIG
+# =========================================================
+
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -68,7 +72,6 @@ async def db_execute(
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-
         await db.executescript(
             """
             CREATE TABLE IF NOT EXISTS admins (
@@ -94,6 +97,8 @@ async def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 username TEXT,
+                full_name TEXT,
+                reason TEXT DEFAULT 'support',
                 status TEXT NOT NULL DEFAULT 'open',
                 assigned_admin INTEGER,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -113,7 +118,6 @@ async def init_db():
             """
         )
 
-        # Главный админ всегда существует
         await db.execute(
             """
             INSERT OR REPLACE INTO admins(user_id, is_main)
@@ -122,26 +126,43 @@ async def init_db():
             (MAIN_ADMIN_ID,),
         )
 
-        # Стандартные цены
         prices = [
-            ("audio", "Заказать Аудио", 249),
-            ("distrokid", "DistroKid: дистрибуция аудио — 1 год", 1649),
-            ("subscription", "Подписка на загрузку аудио", 1000),
+            (
+                "audio",
+                "Заказать Аудио",
+                249,
+            ),
+            (
+                "distrokid",
+                "DistroKid: дистрибуция аудио - 1 год",
+                1649,
+            ),
+            (
+                "subscription",
+                "Подписка на загрузку аудио",
+                1000,
+            ),
         ]
 
         for key, title, amount in prices:
             await db.execute(
                 """
-                INSERT OR IGNORE INTO prices(key, title, amount)
+                INSERT OR IGNORE INTO prices(
+                    key,
+                    title,
+                    amount
+                )
                 VALUES (?, ?, ?)
                 """,
-                (key, title, amount),
+                (
+                    key,
+                    title,
+                    amount,
+                ),
             )
 
         await db.commit()
 
-    # Старый ADMIN_IDS можно оставить в .env.
-    # Эти пользователи автоматически получат админку.
     raw_admins = os.getenv("ADMIN_IDS", "")
 
     for value in raw_admins.split(","):
@@ -150,7 +171,10 @@ async def init_db():
         if value.isdigit():
             await db_execute(
                 """
-                INSERT OR IGNORE INTO admins(user_id, is_main)
+                INSERT OR IGNORE INTO admins(
+                    user_id,
+                    is_main
+                )
                 VALUES (?, 0)
                 """,
                 (int(value),),
@@ -188,13 +212,19 @@ async def get_admin_ids():
         fetch=True,
     )
 
-    return [int(row["user_id"]) for row in rows]
+    return [
+        int(row["user_id"])
+        for row in rows
+    ]
 
 
 async def add_admin(user_id: int):
     await db_execute(
         """
-        INSERT OR REPLACE INTO admins(user_id, is_main)
+        INSERT OR REPLACE INTO admins(
+            user_id,
+            is_main
+        )
         VALUES (?, 0)
         """,
         (user_id,),
@@ -213,8 +243,6 @@ async def remove_admin(user_id: int):
         (user_id,),
     )
 
-    # Если у админа были активные обращения,
-    # они возвращаются в очередь поддержки.
     await db_execute(
         """
         UPDATE tickets
@@ -225,7 +253,6 @@ async def remove_admin(user_id: int):
         (user_id,),
     )
 
-    # Удаляем активный выбранный тикет
     await db_execute(
         """
         DELETE FROM settings
@@ -267,7 +294,10 @@ async def get_price(key):
     if not row:
         return "", 0
 
-    return row["title"], int(row["amount"])
+    return (
+        row["title"],
+        int(row["amount"]),
+    )
 
 
 async def set_price(key, amount):
@@ -277,7 +307,10 @@ async def set_price(key, amount):
         SET amount = ?
         WHERE key = ?
         """,
-        (amount, key),
+        (
+            amount,
+            key,
+        ),
     )
 
 
@@ -290,12 +323,19 @@ async def get_user_price(user_id, key):
         FROM settings
         WHERE key = ?
         """,
-        (f"active_promo:{user_id}",),
+        (
+            f"active_promo:{user_id}",
+        ),
         fetchone=True,
     )
 
     if not promo_row:
-        return title, amount, None, 0
+        return (
+            title,
+            amount,
+            None,
+            0,
+        )
 
     promo = await db_execute(
         """
@@ -303,18 +343,29 @@ async def get_user_price(user_id, key):
         FROM promo_codes
         WHERE code = ?
         """,
-        (promo_row["value"],),
+        (
+            promo_row["value"],
+        ),
         fetchone=True,
     )
 
     if not promo or not promo["active"]:
-        return title, amount, None, 0
+        return (
+            title,
+            amount,
+            None,
+            0,
+        )
 
     discount = int(promo["discount"])
 
     final_amount = max(
         0,
-        round(amount * (100 - discount) / 100)
+        round(
+            amount
+            * (100 - discount)
+            / 100
+        ),
     )
 
     return (
@@ -326,10 +377,65 @@ async def get_user_price(user_id, key):
 
 
 # =========================================================
+# PROMO
+# =========================================================
+
+async def activate_promo(
+    user_id: int,
+    code: str,
+):
+    code = code.strip().upper()
+
+    row = await db_execute(
+        """
+        SELECT code, discount, active
+        FROM promo_codes
+        WHERE code = ?
+        """,
+        (code,),
+        fetchone=True,
+    )
+
+    if not row:
+        return False, "Промокод не найден."
+
+    if not row["active"]:
+        return False, "Этот промокод выключен."
+
+    await db_execute(
+        """
+        INSERT OR REPLACE INTO settings(
+            key,
+            value
+        )
+        VALUES (?, ?)
+        """,
+        (
+            f"active_promo:{user_id}",
+            code,
+        ),
+    )
+
+    await db_execute(
+        """
+        UPDATE promo_codes
+        SET uses = uses + 1
+        WHERE code = ?
+        """,
+        (code,),
+    )
+
+    return (
+        True,
+        f"Промокод активирован: скидка {row['discount']}%.",
+    )
+
+
+# =========================================================
 # TICKETS
 # =========================================================
 
-async def get_open_ticket(user_id):
+async def get_open_ticket(user_id: int):
     return await db_execute(
         """
         SELECT *
@@ -344,7 +450,7 @@ async def get_open_ticket(user_id):
     )
 
 
-async def get_ticket(ticket_id):
+async def get_ticket(ticket_id: int):
     return await db_execute(
         """
         SELECT *
@@ -356,20 +462,49 @@ async def get_ticket(ticket_id):
     )
 
 
-async def create_ticket(user: Message):
+async def create_ticket(
+    user_id: int,
+    username: str,
+    full_name: str,
+    reason: str,
+):
     await db_execute(
         """
-        INSERT INTO tickets(user_id, username)
-        VALUES (?, ?)
+        INSERT INTO tickets(
+            user_id,
+            username,
+            full_name,
+            reason
+        )
+        VALUES (?, ?, ?, ?)
         """,
         (
-            user.from_user.id,
-            user.from_user.username or "",
+            user_id,
+            username,
+            full_name,
+            reason,
         ),
     )
 
 
-async def assign_ticket(ticket_id, admin_id):
+async def assign_ticket(
+    ticket_id: int,
+    admin_id: int,
+):
+    ticket = await get_ticket(ticket_id)
+
+    if not ticket:
+        return False
+
+    if ticket["status"] != "open":
+        return False
+
+    if (
+        ticket["assigned_admin"]
+        and ticket["assigned_admin"] != admin_id
+    ):
+        return False
+
     await db_execute(
         """
         UPDATE tickets
@@ -377,13 +512,18 @@ async def assign_ticket(ticket_id, admin_id):
         WHERE id = ?
         AND status = 'open'
         """,
-        (admin_id, ticket_id),
+        (
+            admin_id,
+            ticket_id,
+        ),
     )
 
-    # Запоминаем, с каким обращением сейчас работает админ.
     await db_execute(
         """
-        INSERT OR REPLACE INTO settings(key, value)
+        INSERT OR REPLACE INTO settings(
+            key,
+            value
+        )
         VALUES (?, ?)
         """,
         (
@@ -392,8 +532,74 @@ async def assign_ticket(ticket_id, admin_id):
         ),
     )
 
+    return True
 
-async def close_ticket(ticket_id):
+
+async def get_active_admin_ticket(
+    admin_id: int,
+):
+    row = await db_execute(
+        """
+        SELECT value
+        FROM settings
+        WHERE key = ?
+        """,
+        (
+            f"active_ticket:{admin_id}",
+        ),
+        fetchone=True,
+    )
+
+    if not row:
+        return None
+
+    try:
+        ticket_id = int(row["value"])
+    except ValueError:
+        return None
+
+    ticket = await get_ticket(ticket_id)
+
+    if not ticket:
+        await db_execute(
+            """
+            DELETE FROM settings
+            WHERE key = ?
+            """,
+            (
+                f"active_ticket:{admin_id}",
+            ),
+        )
+        return None
+
+    if ticket["status"] != "open":
+        await db_execute(
+            """
+            DELETE FROM settings
+            WHERE key = ?
+            """,
+            (
+                f"active_ticket:{admin_id}",
+            ),
+        )
+        return None
+
+    if ticket["assigned_admin"] != admin_id:
+        await db_execute(
+            """
+            DELETE FROM settings
+            WHERE key = ?
+            """,
+            (
+                f"active_ticket:{admin_id}",
+            ),
+        )
+        return None
+
+    return ticket
+
+
+async def close_ticket(ticket_id: int):
     ticket = await get_ticket(ticket_id)
 
     if not ticket:
@@ -415,7 +621,9 @@ async def close_ticket(ticket_id):
             DELETE FROM settings
             WHERE key = ?
             """,
-            (f"active_ticket:{ticket['assigned_admin']}",),
+            (
+                f"active_ticket:{ticket['assigned_admin']}",
+            ),
         )
 
 
@@ -507,7 +715,10 @@ def kb_ticket_user():
     )
 
 
-def kb_admin_ticket(ticket_id, taken=False):
+def kb_admin_ticket(
+    ticket_id: int,
+    taken=False,
+):
     buttons = []
 
     if not taken:
@@ -529,7 +740,9 @@ def kb_admin_ticket(ticket_id, taken=False):
         ]
     )
 
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    return InlineKeyboardMarkup(
+        inline_keyboard=buttons
+    )
 
 
 def kb_admin_panel():
@@ -631,14 +844,43 @@ def kb_price_menu():
     )
 
 
+def kb_promo_admin():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➕ Создать промокод",
+                    callback_data="admin:promo:add",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔁 Включить/выключить",
+                    callback_data="admin:promo:toggle",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="↩️ Назад",
+                    callback_data="admin:panel",
+                )
+            ],
+        ]
+    )
+
+
 # =========================================================
 # MESSAGE HELPERS
 # =========================================================
 
-async def delete_message_safe(message: Message):
+async def delete_message_safe(
+    message: Message,
+):
     try:
         await message.delete()
     except TelegramBadRequest:
+        pass
+    except Exception:
         pass
 
 
@@ -666,12 +908,14 @@ async def copy_message_safe(
             from_chat_id=from_chat_id,
             message_id=message_id,
         )
+        return True
 
     except Exception as error:
         logging.warning(
             "Ошибка копирования сообщения: %s",
             error,
         )
+        return False
 
 
 # =========================================================
@@ -679,7 +923,9 @@ async def copy_message_safe(
 # =========================================================
 
 @router.message(CommandStart())
-async def cmd_start(message: Message):
+async def cmd_start(
+    message: Message,
+):
     await message.answer(
         "<b>Добро пожаловать в JOKAS Audio 🎧</b>\n\n"
         "Выберите нужный раздел:",
@@ -687,17 +933,26 @@ async def cmd_start(message: Message):
     )
 
 
+# =========================================================
+# ADMIN COMMAND
+# =========================================================
+
 @router.message(Command("admin"))
-async def cmd_admin(message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.answer("❌ У вас нет доступа к админ-панели.")
+async def cmd_admin(
+    message: Message,
+):
+    if not await is_admin(
+        message.from_user.id
+    ):
+        await message.answer(
+            "❌ У вас нет доступа к админ-панели."
+        )
         return
 
     await message.answer(
         "<b>🛠 Админ-панель</b>\n\n"
         "Администратор также является сотрудником поддержки.\n"
-        "Здесь можно управлять обращениями, ценами, "
-        "промокодами и администраторами.",
+        "Выберите раздел:",
         reply_markup=kb_admin_panel(),
     )
 
@@ -706,8 +961,12 @@ async def cmd_admin(message: Message):
 # HOME
 # =========================================================
 
-@router.callback_query(F.data == "home")
-async def cb_home(call: CallbackQuery):
+@router.callback_query(
+    F.data == "home"
+)
+async def cb_home(
+    call: CallbackQuery,
+):
     await call.answer()
 
     await replace_with(
@@ -722,13 +981,19 @@ async def cb_home(call: CallbackQuery):
 # AUDIO
 # =========================================================
 
-@router.callback_query(F.data == "order:audio")
-async def cb_audio(call: CallbackQuery):
+@router.callback_query(
+    F.data == "order:audio"
+)
+async def cb_audio(
+    call: CallbackQuery,
+):
     await call.answer()
 
-    title, amount, promo_code, discount = await get_user_price(
-        call.from_user.id,
-        "audio",
+    title, amount, promo_code, discount = (
+        await get_user_price(
+            call.from_user.id,
+            "audio",
+        )
     )
 
     promo_line = ""
@@ -736,7 +1001,8 @@ async def cb_audio(call: CallbackQuery):
     if promo_code:
         promo_line = (
             f"\n🎟 Промокод "
-            f"<code>{promo_code}</code>: -{discount}%\n"
+            f"<code>{promo_code}</code>: "
+            f"-{discount}%\n"
         )
 
     await replace_with(
@@ -745,7 +1011,7 @@ async def cb_audio(call: CallbackQuery):
         f"Цена: <b>{amount} ₽</b>"
         f"{promo_line}\n"
         "Оплата проходит через менеджера.\n"
-        "Нажмите кнопку ниже, чтобы открыть обращение.",
+        "Нажмите кнопку ниже:",
         InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -769,13 +1035,19 @@ async def cb_audio(call: CallbackQuery):
 # DISTROKID
 # =========================================================
 
-@router.callback_query(F.data == "distrokid")
-async def cb_distrokid(call: CallbackQuery):
+@router.callback_query(
+    F.data == "distrokid"
+)
+async def cb_distrokid(
+    call: CallbackQuery,
+):
     await call.answer()
 
-    title, amount, promo_code, discount = await get_user_price(
-        call.from_user.id,
-        "distrokid",
+    title, amount, promo_code, discount = (
+        await get_user_price(
+            call.from_user.id,
+            "distrokid",
+        )
     )
 
     promo_line = ""
@@ -783,7 +1055,8 @@ async def cb_distrokid(call: CallbackQuery):
     if promo_code:
         promo_line = (
             f"\n🎟 Промокод "
-            f"<code>{promo_code}</code>: -{discount}%\n"
+            f"<code>{promo_code}</code>: "
+            f"-{discount}%\n"
         )
 
     await replace_with(
@@ -815,14 +1088,18 @@ async def cb_distrokid(call: CallbackQuery):
 # OTHER
 # =========================================================
 
-@router.callback_query(F.data == "other")
-async def cb_other(call: CallbackQuery):
+@router.callback_query(
+    F.data == "other"
+)
+async def cb_other(
+    call: CallbackQuery,
+):
     await call.answer()
 
     await replace_with(
         call.message,
         "📦 <b>Другие товары</b>\n\n"
-        "• DistroKid — дистрибуция аудио на 1 год\n"
+        "• DistroKid - дистрибуция аудио на 1 год\n"
         "• Подписка на загрузку аудио\n\n"
         "Для заказа откройте обращение с менеджером.",
         InlineKeyboardMarkup(
@@ -845,16 +1122,23 @@ async def cb_other(call: CallbackQuery):
 
 
 # =========================================================
-# PROMO
+# PROMO USER
 # =========================================================
 
-@router.callback_query(F.data == "promo")
-async def cb_promo(call: CallbackQuery):
+@router.callback_query(
+    F.data == "promo"
+)
+async def cb_promo(
+    call: CallbackQuery,
+):
     await call.answer()
 
     await db_execute(
         """
-        INSERT OR REPLACE INTO settings(key, value)
+        INSERT OR REPLACE INTO settings(
+            key,
+            value
+        )
         VALUES (?, ?)
         """,
         (
@@ -877,8 +1161,12 @@ async def cb_promo(call: CallbackQuery):
 # SUPPORT
 # =========================================================
 
-@router.callback_query(F.data == "support")
-async def cb_support(call: CallbackQuery):
+@router.callback_query(
+    F.data == "support"
+)
+async def cb_support(
+    call: CallbackQuery,
+):
     await call.answer()
 
     ticket = await get_open_ticket(
@@ -886,7 +1174,6 @@ async def cb_support(call: CallbackQuery):
     )
 
     if ticket:
-
         if ticket["assigned_admin"]:
             text = (
                 "💬 <b>Ваше обращение</b>\n\n"
@@ -895,12 +1182,11 @@ async def cb_support(call: CallbackQuery):
                 f"<code>{ticket['assigned_admin']}</code>\n\n"
                 "Пишите сообщения прямо сюда."
             )
-
         else:
             text = (
                 "💬 <b>Ваше обращение</b>\n\n"
                 f"Обращение: <b>#{ticket['id']}</b>\n\n"
-                "Обращение отправлено всем администраторам.\n"
+                "Обращение отправлено администраторам.\n"
                 "Ожидайте, пока один из них его возьмёт."
             )
 
@@ -909,7 +1195,6 @@ async def cb_support(call: CallbackQuery):
             text,
             kb_ticket_user(),
         )
-
         return
 
     await replace_with(
@@ -918,28 +1203,47 @@ async def cb_support(call: CallbackQuery):
         "Здесь можно открыть обращение с администраторами.\n\n"
         "После открытия все администраторы получат уведомление.\n"
         "Первый администратор, который возьмёт обращение, "
-        "станет ответственным за него.",
+        "станет ответственным.",
         kb_support_start(),
     )
 
 
+# =========================================================
+# CREATE TICKET
+# =========================================================
+
 async def open_ticket_for_user(
-    message: Message,
-    reason="support",
+    user_id: int,
+    username: str,
+    full_name: str,
+    reason: str = "support",
 ):
+    # ВАЖНО:
+    # user_id приходит именно от пользователя,
+    # а НЕ из call.message.from_user.
 
     existing = await get_open_ticket(
-        message.from_user.id
+        user_id
     )
 
     if existing:
         return existing
 
-    await create_ticket(message)
+    await create_ticket(
+        user_id=user_id,
+        username=username,
+        full_name=full_name,
+        reason=reason,
+    )
 
     ticket = await get_open_ticket(
-        message.from_user.id
+        user_id
     )
+
+    if not ticket:
+        raise RuntimeError(
+            "Не удалось создать тикет."
+        )
 
     if reason == "payment":
         reason_text = (
@@ -952,17 +1256,26 @@ async def open_ticket_for_user(
             "в поддержку."
         )
 
-    username = (
-        f"@{message.from_user.username}"
-        if message.from_user.username
+    username_text = (
+        f"@{username}"
+        if username
         else "без username"
+    )
+
+    full_name_text = (
+        full_name
+        if full_name
+        else "Без имени"
     )
 
     admin_text = (
         f"📨 <b>Новое обращение #{ticket['id']}</b>\n\n"
-        f"👤 Пользователь: {message.from_user.full_name}\n"
-        f"🔗 Username: {username}\n"
-        f"🆔 ID: <code>{message.from_user.id}</code>\n\n"
+        f"👤 <b>Пользователь:</b> "
+        f"{full_name_text}\n"
+        f"🔗 <b>Username:</b> "
+        f"{username_text}\n"
+        f"🆔 <b>ID:</b> "
+        f"<code>{user_id}</code>\n\n"
         f"{reason_text}\n\n"
         "Первый администратор, который нажмёт "
         "«Взять обращение», станет ответственным."
@@ -970,8 +1283,9 @@ async def open_ticket_for_user(
 
     admin_ids = await get_admin_ids()
 
-    for admin_id in admin_ids:
+    sent_count = 0
 
+    for admin_id in admin_ids:
         try:
             await bot.send_message(
                 admin_id,
@@ -981,28 +1295,51 @@ async def open_ticket_for_user(
                 ),
             )
 
+            sent_count += 1
+
         except Exception as error:
             logging.warning(
-                "Не удалось отправить обращение админу %s: %s",
+                "Не удалось отправить тикет "
+                "#%s админу %s: %s",
+                ticket["id"],
                 admin_id,
                 error,
             )
 
+    logging.info(
+        "Создан тикет #%s. "
+        "user_id=%s username=%s "
+        "admins=%s/%s",
+        ticket["id"],
+        user_id,
+        username,
+        sent_count,
+        len(admin_ids),
+    )
+
     return ticket
 
 
-@router.callback_query(F.data.startswith("ticket:create"))
-async def cb_create_ticket(call: CallbackQuery):
-
+@router.callback_query(
+    F.data.startswith("ticket:create")
+)
+async def cb_create_ticket(
+    call: CallbackQuery,
+):
     reason = (
         "payment"
         if call.data.endswith(":payment")
         else "support"
     )
 
+    # ВАЖНО:
+    # call.from_user - реальный пользователь,
+    # который нажал кнопку.
     ticket = await open_ticket_for_user(
-        call.message,
-        reason,
+        user_id=call.from_user.id,
+        username=call.from_user.username or "",
+        full_name=call.from_user.full_name or "",
+        reason=reason,
     )
 
     await call.answer(
@@ -1013,7 +1350,7 @@ async def cb_create_ticket(call: CallbackQuery):
         call.message,
         f"💬 <b>Обращение #{ticket['id']}</b>\n\n"
         "Готово.\n"
-        "Все администраторы получили уведомление.\n\n"
+        "Администраторы получили уведомление.\n\n"
         "Пишите сообщения прямо сюда.",
         kb_ticket_user(),
     )
@@ -1023,9 +1360,12 @@ async def cb_create_ticket(call: CallbackQuery):
 # USER CLOSE TICKET
 # =========================================================
 
-@router.callback_query(F.data == "ticket:user_close")
-async def cb_user_close(call: CallbackQuery):
-
+@router.callback_query(
+    F.data == "ticket:user_close"
+)
+async def cb_user_close(
+    call: CallbackQuery,
+):
     ticket = await get_open_ticket(
         call.from_user.id
     )
@@ -1042,12 +1382,11 @@ async def cb_user_close(call: CallbackQuery):
     )
 
     if ticket["assigned_admin"]:
-
         try:
             await bot.send_message(
                 ticket["assigned_admin"],
-                f"🔒 Пользователь закрыл обращение "
-                f"#{ticket['id']}.",
+                f"🔒 Пользователь закрыл "
+                f"обращение #{ticket['id']}.",
             )
         except Exception:
             pass
@@ -1071,11 +1410,12 @@ async def cb_user_close(call: CallbackQuery):
 @router.callback_query(
     F.data.startswith("ticket:take:")
 )
-async def cb_take_ticket(call: CallbackQuery):
+async def cb_take_ticket(
+    call: CallbackQuery,
+):
+    admin_id = call.from_user.id
 
-    if not await is_admin(
-        call.from_user.id
-    ):
+    if not await is_admin(admin_id):
         await call.answer(
             "Нет доступа.",
             show_alert=True,
@@ -1106,8 +1446,7 @@ async def cb_take_ticket(call: CallbackQuery):
 
     if (
         ticket["assigned_admin"]
-        and ticket["assigned_admin"]
-        != call.from_user.id
+        and ticket["assigned_admin"] != admin_id
     ):
         await call.answer(
             "Это обращение уже взял другой администратор.",
@@ -1115,20 +1454,44 @@ async def cb_take_ticket(call: CallbackQuery):
         )
         return
 
-    await assign_ticket(
-        ticket_id,
-        call.from_user.id,
+    # Если админ уже ведёт другой тикет,
+    # переключаем активный тикет на новый.
+    old_ticket = await get_active_admin_ticket(
+        admin_id
     )
+
+    if old_ticket and old_ticket["id"] != ticket_id:
+        await call.answer(
+            "Сначала закройте текущее активное обращение.",
+            show_alert=True,
+        )
+        return
+
+    success = await assign_ticket(
+        ticket_id,
+        admin_id,
+    )
+
+    if not success:
+        await call.answer(
+            "Не удалось взять обращение.",
+            show_alert=True,
+        )
+        return
 
     await call.answer(
         "Обращение взято."
     )
 
     try:
+        old_text = call.message.text or ""
+
         await call.message.edit_text(
-            (call.message.text or "")
+            old_text
             + "\n\n"
-            "✅ <b>Взято вами.</b>",
+            "✅ <b>Взято вами.</b>\n\n"
+            "Теперь отправляйте сообщения "
+            "обычным текстом в этот чат с ботом.",
             reply_markup=kb_admin_ticket(
                 ticket_id,
                 taken=True,
@@ -1138,17 +1501,25 @@ async def cb_take_ticket(call: CallbackQuery):
     except TelegramBadRequest:
         pass
 
-    await bot.send_message(
-        ticket["user_id"],
-        f"👨‍💼 <b>Администратор подключился.</b>\n\n"
-        f"Обращение #{ticket_id}\n\n"
-        "Теперь можете писать сообщения сюда.",
-        reply_markup=kb_ticket_user(),
-    )
+    try:
+        await bot.send_message(
+            ticket["user_id"],
+            f"👨‍💼 <b>Администратор подключился.</b>\n\n"
+            f"Обращение #{ticket_id}\n\n"
+            "Теперь можете писать сообщения сюда.",
+            reply_markup=kb_ticket_user(),
+        )
+    except Exception as error:
+        logging.warning(
+            "Не удалось уведомить пользователя "
+            "%s о назначении тикета: %s",
+            ticket["user_id"],
+            error,
+        )
 
 
 # =========================================================
-# CLOSE TICKET
+# CLOSE TICKET ADMIN
 # =========================================================
 
 @router.callback_query(
@@ -1157,10 +1528,9 @@ async def cb_take_ticket(call: CallbackQuery):
 async def cb_admin_close_ticket(
     call: CallbackQuery,
 ):
+    admin_id = call.from_user.id
 
-    if not await is_admin(
-        call.from_user.id
-    ):
+    if not await is_admin(admin_id):
         await call.answer(
             "Нет доступа.",
             show_alert=True,
@@ -1182,14 +1552,20 @@ async def cb_admin_close_ticket(
         )
         return
 
-    # Главный админ может закрывать любое обращение.
-    # Обычный админ — только своё.
+    if ticket["status"] != "open":
+        await call.answer(
+            "Обращение уже закрыто.",
+            show_alert=True,
+        )
+        return
+
     if (
         ticket["assigned_admin"]
-        not in (None, call.from_user.id)
-        and not await is_main_admin(
-            call.from_user.id
+        not in (
+            None,
+            admin_id,
         )
+        and not await is_main_admin(admin_id)
     ):
         await call.answer(
             "Закрыть это обращение может "
@@ -1234,8 +1610,9 @@ async def cb_admin_close_ticket(
 @router.callback_query(
     F.data == "admin:panel"
 )
-async def cb_admin_panel(call: CallbackQuery):
-
+async def cb_admin_panel(
+    call: CallbackQuery,
+):
     if not await is_admin(
         call.from_user.id
     ):
@@ -1263,8 +1640,9 @@ async def cb_admin_panel(call: CallbackQuery):
 @router.callback_query(
     F.data == "admin:prices"
 )
-async def cb_admin_prices(call: CallbackQuery):
-
+async def cb_admin_prices(
+    call: CallbackQuery,
+):
     if not await is_admin(
         call.from_user.id
     ):
@@ -1299,7 +1677,6 @@ async def cb_admin_prices(call: CallbackQuery):
 async def cb_admin_price(
     call: CallbackQuery,
 ):
-
     if not await is_admin(
         call.from_user.id
     ):
@@ -1311,7 +1688,7 @@ async def cb_admin_price(
 
     key = call.data.rsplit(
         ":",
-        1
+        1,
     )[1]
 
     title, amount = await get_price(
@@ -1320,7 +1697,10 @@ async def cb_admin_price(
 
     await db_execute(
         """
-        INSERT OR REPLACE INTO settings(key, value)
+        INSERT OR REPLACE INTO settings(
+            key,
+            value
+        )
         VALUES (?, ?)
         """,
         (
@@ -1344,7 +1724,7 @@ async def cb_admin_price(
 
 
 # =========================================================
-# ADMIN / SUPPORT MANAGEMENT
+# ADMIN MANAGEMENT
 # =========================================================
 
 @router.callback_query(
@@ -1353,14 +1733,11 @@ async def cb_admin_price(
 async def cb_admin_admins(
     call: CallbackQuery,
 ):
-
-    # Только главный админ может управлять админами.
     if not await is_main_admin(
         call.from_user.id
     ):
         await call.answer(
-            "Только главный администратор может "
-            "управлять администраторами.",
+            "Только главный администратор.",
             show_alert=True,
         )
         return
@@ -1373,16 +1750,13 @@ async def cb_admin_admins(
         call.message,
         "👥 <b>Админы / Поддержка</b>\n\n"
         f"Сейчас сотрудников поддержки: <b>{count}</b>\n\n"
-        "Каждый выданный здесь админ автоматически "
-        "получает доступ к обращениям пользователей.\n\n"
-        "Главный админ может выдавать и снимать права.",
+        "Каждый выданный здесь админ "
+        "получает новые обращения.\n\n"
+        "Главный админ может выдавать "
+        "и снимать права.",
         kb_admins_menu(),
     )
 
-
-# =========================================================
-# ADD ADMIN
-# =========================================================
 
 @router.callback_query(
     F.data == "admin:add"
@@ -1390,7 +1764,6 @@ async def cb_admin_admins(
 async def cb_admin_add(
     call: CallbackQuery,
 ):
-
     if not await is_main_admin(
         call.from_user.id
     ):
@@ -1402,7 +1775,10 @@ async def cb_admin_add(
 
     await db_execute(
         """
-        INSERT OR REPLACE INTO settings(key, value)
+        INSERT OR REPLACE INTO settings(
+            key,
+            value
+        )
         VALUES (?, ?)
         """,
         (
@@ -1419,16 +1795,11 @@ async def cb_admin_add(
         "Отправьте Telegram ID пользователя.\n\n"
         "Например:\n"
         "<code>123456789</code>\n\n"
-        "После выдачи этот пользователь сразу "
-        "станет сотрудником поддержки и будет "
-        "получать новые обращения.",
+        "После выдачи пользователь станет "
+        "администратором и сотрудником поддержки.",
         kb_back(),
     )
 
-
-# =========================================================
-# REMOVE ADMIN
-# =========================================================
 
 @router.callback_query(
     F.data == "admin:remove"
@@ -1436,7 +1807,6 @@ async def cb_admin_add(
 async def cb_admin_remove(
     call: CallbackQuery,
 ):
-
     if not await is_main_admin(
         call.from_user.id
     ):
@@ -1448,7 +1818,10 @@ async def cb_admin_remove(
 
     await db_execute(
         """
-        INSERT OR REPLACE INTO settings(key, value)
+        INSERT OR REPLACE INTO settings(
+            key,
+            value
+        )
         VALUES (?, ?)
         """,
         (
@@ -1463,17 +1836,10 @@ async def cb_admin_remove(
         call.message,
         "➖ <b>Снять админку</b>\n\n"
         "Отправьте Telegram ID администратора.\n\n"
-        "Главного администратора снять нельзя.\n\n"
-        "Если у снимаемого администратора есть "
-        "открытые обращения, они вернутся в общую "
-        "очередь поддержки.",
+        "Главного администратора снять нельзя.",
         kb_back(),
     )
 
-
-# =========================================================
-# ADMIN LIST
-# =========================================================
 
 @router.callback_query(
     F.data == "admin:list"
@@ -1481,7 +1847,6 @@ async def cb_admin_remove(
 async def cb_admin_list(
     call: CallbackQuery,
 ):
-
     if not await is_main_admin(
         call.from_user.id
     ):
@@ -1505,7 +1870,6 @@ async def cb_admin_list(
     ]
 
     for row in rows:
-
         if row["is_main"]:
             role = "👑 Главный админ"
         else:
@@ -1526,7 +1890,7 @@ async def cb_admin_list(
 
 
 # =========================================================
-# ADMIN TICKETS
+# ADMIN TICKETS LIST
 # =========================================================
 
 @router.callback_query(
@@ -1535,7 +1899,6 @@ async def cb_admin_list(
 async def cb_admin_tickets(
     call: CallbackQuery,
 ):
-
     if not await is_admin(
         call.from_user.id
     ):
@@ -1557,33 +1920,35 @@ async def cb_admin_tickets(
     )
 
     if not rows:
-
         text = (
             "📨 <b>Обращения</b>\n\n"
             "Открытых обращений нет."
         )
-
     else:
-
         lines = [
             "📨 <b>Открытые обращения</b>\n"
         ]
 
         for row in rows:
-
             if row["assigned_admin"]:
                 status = (
-                    "👨‍💼 "
-                    f"админ <code>{row['assigned_admin']}</code>"
+                    "👨‍💼 админ "
+                    f"<code>{row['assigned_admin']}</code>"
                 )
             else:
                 status = "⏳ ожидает администратора"
 
+            username = (
+                f"@{row['username']}"
+                if row["username"]
+                else "без username"
+            )
+
             lines.append(
-                f"#{row['id']} — "
-                f"{status}\n"
-                f"Пользователь: "
-                f"<code>{row['user_id']}</code>\n"
+                f"#{row['id']} - {status}\n"
+                f"👤 {row['full_name'] or 'Без имени'}\n"
+                f"🔗 {username}\n"
+                f"🆔 <code>{row['user_id']}</code>\n"
             )
 
         text = "\n".join(lines)
@@ -1607,7 +1972,7 @@ async def cb_admin_tickets(
 
 
 # =========================================================
-# PROMOCODES
+# PROMO ADMIN
 # =========================================================
 
 @router.callback_query(
@@ -1616,7 +1981,6 @@ async def cb_admin_tickets(
 async def cb_admin_promos(
     call: CallbackQuery,
 ):
-
     if not await is_admin(
         call.from_user.id
     ):
@@ -1636,13 +2000,11 @@ async def cb_admin_promos(
     )
 
     if rows:
-
         lines = [
             "🎟 <b>Промокоды</b>\n"
         ]
 
         for row in rows:
-
             status = (
                 "активен"
                 if row["active"]
@@ -1650,60 +2012,34 @@ async def cb_admin_promos(
             )
 
             lines.append(
-                f"<code>{row['code']}</code> — "
-                f"{row['discount']}% — "
-                f"{status} — "
+                f"<code>{row['code']}</code> - "
+                f"{row['discount']}% - "
+                f"{status} - "
                 f"использований: {row['uses']}"
             )
 
         text = "\n".join(lines)
-
     else:
-
         text = (
             "🎟 <b>Промокоды</b>\n\n"
             "Промокодов пока нет."
         )
-
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="➕ Создать промокод",
-                    callback_data="admin:promo:add",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔁 Включить/выключить",
-                    callback_data="admin:promo:toggle",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="↩️ Назад",
-                    callback_data="admin:panel",
-                )
-            ],
-        ]
-    )
 
     await call.answer()
 
     await replace_with(
         call.message,
         text,
-        keyboard,
+        kb_promo_admin(),
     )
 
 
 @router.callback_query(
     F.data == "admin:promo:add"
 )
-async def cb_promo_add(
+async def cb_admin_promo_add(
     call: CallbackQuery,
 ):
-
     if not await is_admin(
         call.from_user.id
     ):
@@ -1715,11 +2051,14 @@ async def cb_promo_add(
 
     await db_execute(
         """
-        INSERT OR REPLACE INTO settings(key, value)
+        INSERT OR REPLACE INTO settings(
+            key,
+            value
+        )
         VALUES (?, ?)
         """,
         (
-            f"awaiting_promo_create:{call.from_user.id}",
+            f"awaiting_promo_add:{call.from_user.id}",
             "1",
         ),
     )
@@ -1729,10 +2068,11 @@ async def cb_promo_add(
     await replace_with(
         call.message,
         "➕ <b>Создание промокода</b>\n\n"
-        "Отправьте:\n"
-        "<code>КОД СКИДКА</code>\n\n"
+        "Отправьте промокод и скидку через пробел.\n\n"
         "Например:\n"
-        "<code>WELCOME 10</code>",
+        "<code>WELCOME10 10</code>\n\n"
+        "Это создаст код WELCOME10 "
+        "со скидкой 10%.",
         kb_back(),
     )
 
@@ -1740,10 +2080,9 @@ async def cb_promo_add(
 @router.callback_query(
     F.data == "admin:promo:toggle"
 )
-async def cb_promo_toggle(
+async def cb_admin_promo_toggle(
     call: CallbackQuery,
 ):
-
     if not await is_admin(
         call.from_user.id
     ):
@@ -1755,7 +2094,10 @@ async def cb_promo_toggle(
 
     await db_execute(
         """
-        INSERT OR REPLACE INTO settings(key, value)
+        INSERT OR REPLACE INTO settings(
+            key,
+            value
+        )
         VALUES (?, ?)
         """,
         (
@@ -1768,41 +2110,24 @@ async def cb_promo_toggle(
 
     await replace_with(
         call.message,
-        "🔁 <b>Включение/выключение промокода</b>\n\n"
-        "Отправьте код промокода.",
+        "🔁 <b>Включение / выключение</b>\n\n"
+        "Отправьте код промокода.\n\n"
+        "Например:\n"
+        "<code>WELCOME10</code>",
         kb_back(),
     )
 
 
 # =========================================================
-# UNIVERSAL MESSAGE
+# TEXT MESSAGE ROUTER
 # =========================================================
 
-@router.message()
-async def universal_message(
+async def handle_promo_input(
     message: Message,
 ):
-
     user_id = message.from_user.id
 
-    # -----------------------------------------------------
-    # ADMIN INPUT
-    # -----------------------------------------------------
-
-    if await is_admin(user_id):
-
-        handled = await handle_admin_input(
-            message
-        )
-
-        if handled:
-            return
-
-    # -----------------------------------------------------
-    # USER PROMO
-    # -----------------------------------------------------
-
-    waiting_promo = await db_execute(
+    row = await db_execute(
         """
         SELECT value
         FROM settings
@@ -1814,311 +2139,114 @@ async def universal_message(
         fetchone=True,
     )
 
-    if waiting_promo and message.text:
-
-        code = message.text.strip().upper()
-
-        promo = await db_execute(
-            """
-            SELECT *
-            FROM promo_codes
-            WHERE code = ?
-            AND active = 1
-            """,
-            (code,),
-            fetchone=True,
-        )
-
-        await db_execute(
-            """
-            DELETE FROM settings
-            WHERE key = ?
-            """,
-            (
-                f"awaiting_promo:{user_id}",
-            ),
-        )
-
-        if promo:
-
-            await db_execute(
-                """
-                INSERT OR REPLACE INTO settings(key, value)
-                VALUES (?, ?)
-                """,
-                (
-                    f"active_promo:{user_id}",
-                    code,
-                ),
-            )
-
-            await db_execute(
-                """
-                UPDATE promo_codes
-                SET uses = uses + 1
-                WHERE code = ?
-                """,
-                (code,),
-            )
-
-            await message.answer(
-                f"✅ Промокод <code>{code}</code> активирован.\n\n"
-                f"Скидка: <b>{promo['discount']}%</b>\n\n"
-                "Теперь скидка будет автоматически "
-                "учитываться при оформлении заказа.",
-                reply_markup=kb_main(),
-            )
-
-        else:
-
-            await message.answer(
-                "❌ Промокод не найден или выключен.",
-                reply_markup=kb_main(),
-            )
-
-        return
-
-    # -----------------------------------------------------
-    # USER SUPPORT MESSAGE
-    # -----------------------------------------------------
-
-    ticket = await get_open_ticket(
-        user_id
-    )
-
-    if ticket:
-
-        await relay_user_message(
-            message,
-            ticket,
-        )
-
-        return
-
-
-# =========================================================
-# ADMIN INPUT HANDLER
-# =========================================================
-
-async def handle_admin_input(
-    message: Message,
-):
-
-    user_id = message.from_user.id
-
-    states = [
-        f"awaiting_price:{user_id}",
-        f"awaiting_admin_add:{user_id}",
-        f"awaiting_admin_remove:{user_id}",
-        f"awaiting_promo_create:{user_id}",
-        f"awaiting_promo_toggle:{user_id}",
-    ]
-
-    state = None
-
-    for key in states:
-
-        row = await db_execute(
-            """
-            SELECT value
-            FROM settings
-            WHERE key = ?
-            """,
-            (key,),
-            fetchone=True,
-        )
-
-        if row:
-            state = key
-            break
-
-    # -----------------------------------------------------
-    # NO ADMIN FORM STATE
-    # -----------------------------------------------------
-
-    if not state:
-
-        # Ответ администратора идёт
-        # в выбранное им активное обращение.
-        active = await db_execute(
-            """
-            SELECT value
-            FROM settings
-            WHERE key = ?
-            """,
-            (
-                f"active_ticket:{user_id}",
-            ),
-            fetchone=True,
-        )
-
-        if active:
-
-            ticket_id = int(
-                active["value"]
-            )
-
-            ticket = await get_ticket(
-                ticket_id
-            )
-
-            if (
-                ticket
-                and ticket["status"] == "open"
-                and ticket["assigned_admin"]
-                == user_id
-            ):
-
-                await bot.send_message(
-                    ticket["user_id"],
-                    "👨‍💼 <b>Администратор:</b>",
-                )
-
-                await copy_message_safe(
-                    user_id,
-                    ticket["user_id"],
-                    message.message_id,
-                )
-
-                return True
-
+    if not row:
         return False
 
-    # -----------------------------------------------------
-    # CHANGE PRICE
-    # -----------------------------------------------------
+    await db_execute(
+        """
+        DELETE FROM settings
+        WHERE key = ?
+        """,
+        (
+            f"awaiting_promo:{user_id}",
+        ),
+    )
 
-    if state == f"awaiting_price:{user_id}":
+    success, result = await activate_promo(
+        user_id,
+        message.text or "",
+    )
 
-        if (
-            not message.text
-            or not message.text.strip().isdigit()
-        ):
-            await message.answer(
-                "❌ Отправьте только число.\n"
-                "Например: <code>299</code>"
-            )
-            return True
-
-        amount = int(
-            message.text.strip()
+    await message.answer(
+        (
+            "✅ "
+            if success
+            else "❌ "
         )
+        + result,
+        reply_markup=kb_main(),
+    )
 
-        if amount <= 0:
-            await message.answer(
-                "❌ Цена должна быть больше нуля."
-            )
-            return True
+    return True
 
-        row = await db_execute(
-            """
-            SELECT value
-            FROM settings
-            WHERE key = ?
-            """,
-            (state,),
-            fetchone=True,
-        )
 
-        if row:
+async def handle_admin_state(
+    message: Message,
+):
+    admin_id = message.from_user.id
 
-            price_key = row["value"]
+    if not await is_admin(admin_id):
+        return False
 
-            await set_price(
-                price_key,
-                amount,
-            )
-
-        await db_execute(
-            """
-            DELETE FROM settings
-            WHERE key = ?
-            """,
-            (state,),
-        )
-
-        await message.answer(
-            f"✅ Цена изменена на "
-            f"<b>{amount} ₽</b>.",
-            reply_markup=kb_admin_panel(),
-        )
-
-        return True
+    text = (message.text or "").strip()
 
     # -----------------------------------------------------
     # ADD ADMIN
     # -----------------------------------------------------
 
-    if state == f"awaiting_admin_add:{user_id}":
+    row = await db_execute(
+        """
+        SELECT value
+        FROM settings
+        WHERE key = ?
+        """,
+        (
+            f"awaiting_admin_add:{admin_id}",
+        ),
+        fetchone=True,
+    )
 
-        if not await is_main_admin(user_id):
-            return True
-
-        if (
-            not message.text
-            or not message.text.strip().isdigit()
-        ):
-            await message.answer(
-                "❌ Telegram ID должен быть числом."
-            )
-            return True
-
-        target_id = int(
-            message.text.strip()
-        )
-
-        if target_id == MAIN_ADMIN_ID:
-
-            await message.answer(
-                "ℹ️ Этот пользователь уже является "
-                "главным администратором."
-            )
-
-            await db_execute(
-                """
-                DELETE FROM settings
-                WHERE key = ?
-                """,
-                (state,),
-            )
-
-            return True
-
-        await add_admin(
-            target_id
-        )
-
+    if row:
         await db_execute(
             """
             DELETE FROM settings
             WHERE key = ?
             """,
-            (state,),
+            (
+                f"awaiting_admin_add:{admin_id}",
+            ),
+        )
+
+        if not await is_main_admin(admin_id):
+            await message.answer(
+                "❌ Только главный администратор "
+                "может выдавать админку."
+            )
+            return True
+
+        if not text.isdigit():
+            await message.answer(
+                "❌ ID должен состоять только из цифр."
+            )
+            return True
+
+        new_admin_id = int(text)
+
+        await add_admin(
+            new_admin_id
         )
 
         await message.answer(
             "✅ <b>Админка выдана.</b>\n\n"
-            f"ID: <code>{target_id}</code>\n\n"
+            f"ID: <code>{new_admin_id}</code>\n\n"
             "Теперь этот пользователь является "
-            "администратором и сотрудником поддержки.\n"
-            "Он будет получать новые обращения.",
-            reply_markup=kb_admin_panel(),
+            "администратором и сотрудником поддержки."
         )
 
         try:
-
             await bot.send_message(
-                target_id,
-                "🛡 <b>Вам выдали админку JOKAS Audio.</b>\n\n"
-                "Теперь вы сотрудник поддержки.\n"
-                "Новые обращения пользователей будут "
-                "приходить вам в этот бот.\n\n"
-                "Для управления используйте:\n"
-                "<code>/admin</code>",
+                new_admin_id,
+                "🛡 <b>Вам выдан доступ администратора "
+                "JOKAS Audio.</b>\n\n"
+                "Откройте бота и отправьте /start.\n"
+                "Для панели администратора используйте /admin.",
             )
-
-        except Exception:
-            pass
+        except Exception as error:
+            logging.warning(
+                "Не удалось уведомить нового админа %s: %s",
+                new_admin_id,
+                error,
+            )
 
         return True
 
@@ -2126,54 +2254,101 @@ async def handle_admin_input(
     # REMOVE ADMIN
     # -----------------------------------------------------
 
-    if state == f"awaiting_admin_remove:{user_id}":
+    row = await db_execute(
+        """
+        SELECT value
+        FROM settings
+        WHERE key = ?
+        """,
+        (
+            f"awaiting_admin_remove:{admin_id}",
+        ),
+        fetchone=True,
+    )
 
-        if not await is_main_admin(user_id):
-            return True
+    if row:
+        await db_execute(
+            """
+            DELETE FROM settings
+            WHERE key = ?
+            """,
+            (
+                f"awaiting_admin_remove:{admin_id}",
+            ),
+        )
 
-        if (
-            not message.text
-            or not message.text.strip().isdigit()
-        ):
+        if not await is_main_admin(admin_id):
             await message.answer(
-                "❌ Telegram ID должен быть числом."
+                "❌ Только главный администратор."
             )
             return True
 
-        target_id = int(
-            message.text.strip()
-        )
+        if not text.isdigit():
+            await message.answer(
+                "❌ ID должен состоять только из цифр."
+            )
+            return True
 
-        if target_id == MAIN_ADMIN_ID:
+        remove_id = int(text)
 
+        if remove_id == MAIN_ADMIN_ID:
             await message.answer(
                 "❌ Главного администратора снять нельзя."
             )
-
             return True
 
-        existed = await is_admin(
-            target_id
+        removed = await remove_admin(
+            remove_id
         )
 
-        if not existed:
-
+        if removed:
             await message.answer(
-                "❌ Этот пользователь не является администратором."
+                "✅ <b>Админка снята.</b>\n\n"
+                f"ID: <code>{remove_id}</code>"
+            )
+        else:
+            await message.answer(
+                "❌ Не удалось снять админку."
             )
 
-            await db_execute(
-                """
-                DELETE FROM settings
-                WHERE key = ?
-                """,
-                (state,),
-            )
+        return True
 
+    # -----------------------------------------------------
+    # PRICE
+    # -----------------------------------------------------
+
+    row = await db_execute(
+        """
+        SELECT value
+        FROM settings
+        WHERE key = ?
+        """,
+        (
+            f"awaiting_price:{admin_id}",
+        ),
+        fetchone=True,
+    )
+
+    if row:
+        key = row["value"]
+
+        if not text.isdigit():
+            await message.answer(
+                "❌ Цена должна быть числом."
+            )
             return True
 
-        await remove_admin(
-            target_id
+        amount = int(text)
+
+        if amount < 0:
+            await message.answer(
+                "❌ Цена не может быть отрицательной."
+            )
+            return True
+
+        await set_price(
+            key,
+            amount,
         )
 
         await db_execute(
@@ -2181,65 +2356,58 @@ async def handle_admin_input(
             DELETE FROM settings
             WHERE key = ?
             """,
-            (state,),
+            (
+                f"awaiting_price:{admin_id}",
+            ),
         )
 
         await message.answer(
-            "✅ <b>Админка снята.</b>\n\n"
-            f"ID: <code>{target_id}</code>\n\n"
-            "Пользователь больше не получает "
-            "новые обращения поддержки.",
+            "✅ Цена изменена.\n\n"
+            f"Новая цена: <b>{amount} ₽</b>",
             reply_markup=kb_admin_panel(),
         )
-
-        try:
-
-            await bot.send_message(
-                target_id,
-                "ℹ️ <b>Ваша админка JOKAS Audio снята.</b>\n\n"
-                "Вы больше не являетесь сотрудником поддержки.",
-            )
-
-        except Exception:
-            pass
 
         return True
 
     # -----------------------------------------------------
-    # CREATE PROMO
+    # PROMO ADD
     # -----------------------------------------------------
 
-    if state == f"awaiting_promo_create:{user_id}":
+    row = await db_execute(
+        """
+        SELECT value
+        FROM settings
+        WHERE key = ?
+        """,
+        (
+            f"awaiting_promo_add:{admin_id}",
+        ),
+        fetchone=True,
+    )
 
-        if not message.text:
-            return True
-
-        parts = message.text.strip().split()
+    if row:
+        parts = text.split()
 
         if len(parts) != 2:
             await message.answer(
                 "❌ Формат:\n"
-                "<code>WELCOME 10</code>"
+                "<code>CODE 10</code>"
             )
             return True
 
         code = parts[0].upper()
 
-        if not parts[1].isdigit():
-
+        try:
+            discount = int(parts[1])
+        except ValueError:
             await message.answer(
                 "❌ Скидка должна быть числом."
             )
             return True
 
-        discount = int(
-            parts[1]
-        )
-
-        if not 1 <= discount <= 100:
-
+        if not 0 <= discount <= 100:
             await message.answer(
-                "❌ Скидка должна быть от 1 до 100%."
+                "❌ Скидка должна быть от 0 до 100."
             )
             return True
 
@@ -2248,9 +2416,10 @@ async def handle_admin_input(
             INSERT OR REPLACE INTO promo_codes(
                 code,
                 discount,
-                active
+                active,
+                uses
             )
-            VALUES (?, ?, 1)
+            VALUES (?, ?, 1, 0)
             """,
             (
                 code,
@@ -2263,7 +2432,9 @@ async def handle_admin_input(
             DELETE FROM settings
             WHERE key = ?
             """,
-            (state,),
+            (
+                f"awaiting_promo_add:{admin_id}",
+            ),
         )
 
         await message.answer(
@@ -2276,15 +2447,23 @@ async def handle_admin_input(
         return True
 
     # -----------------------------------------------------
-    # TOGGLE PROMO
+    # PROMO TOGGLE
     # -----------------------------------------------------
 
-    if state == f"awaiting_promo_toggle:{user_id}":
+    row = await db_execute(
+        """
+        SELECT value
+        FROM settings
+        WHERE key = ?
+        """,
+        (
+            f"awaiting_promo_toggle:{admin_id}",
+        ),
+        fetchone=True,
+    )
 
-        if not message.text:
-            return True
-
-        code = message.text.strip().upper()
+    if row:
+        code = text.upper()
 
         promo = await db_execute(
             """
@@ -2297,11 +2476,9 @@ async def handle_admin_input(
         )
 
         if not promo:
-
             await message.answer(
                 "❌ Промокод не найден."
             )
-
             return True
 
         new_status = (
@@ -2327,13 +2504,20 @@ async def handle_admin_input(
             DELETE FROM settings
             WHERE key = ?
             """,
-            (state,),
+            (
+                f"awaiting_promo_toggle:{admin_id}",
+            ),
+        )
+
+        status_text = (
+            "включён"
+            if new_status
+            else "выключен"
         )
 
         await message.answer(
-            f"✅ Промокод <code>{code}</code> "
-            f"{'включён' if new_status else 'выключен'}.",
-            reply_markup=kb_admin_panel(),
+            "✅ Промокод "
+            f"<code>{code}</code> {status_text}."
         )
 
         return True
@@ -2342,52 +2526,202 @@ async def handle_admin_input(
 
 
 # =========================================================
-# USER -> ADMIN
+# MESSAGE RELAY
 # =========================================================
 
 async def relay_user_message(
     message: Message,
-    ticket,
 ):
+    user_id = message.from_user.id
 
-    assigned_admin = ticket[
-        "assigned_admin"
-    ]
+    ticket = await get_open_ticket(
+        user_id
+    )
 
-    if not assigned_admin:
+    if not ticket:
+        return False
 
+    if not ticket["assigned_admin"]:
         await message.answer(
             "⏳ <b>Обращение ещё никто не взял.</b>\n\n"
-            "Ваше сообщение сохранено.\n"
-            "Дождитесь администратора.",
+            "Ваше сообщение получено. "
+            "Дождитесь администратора."
+        )
+        return True
+
+    admin_id = ticket["assigned_admin"]
+
+    header = (
+        f"👤 <b>{message.from_user.full_name}</b>\n"
+    )
+
+    if message.from_user.username:
+        header += (
+            f"🔗 @{message.from_user.username}\n"
         )
 
-        return
-
-    await bot.send_message(
-        assigned_admin,
-        f"👤 <b>Обращение #{ticket['id']}</b>\n\n"
-        f"Пользователь ID: "
-        f"<code>{message.from_user.id}</code>\n\n"
-        "Новое сообщение:",
+    header += (
+        f"🆔 <code>{user_id}</code>\n"
+        f"🎫 Тикет #{ticket['id']}\n\n"
     )
 
-    await copy_message_safe(
-        message.from_user.id,
-        assigned_admin,
-        message.message_id,
+    try:
+        await bot.send_message(
+            admin_id,
+            header,
+        )
+
+        await copy_message_safe(
+            from_chat_id=message.chat.id,
+            to_chat_id=admin_id,
+            message_id=message.message_id,
+        )
+
+    except Exception as error:
+        logging.warning(
+            "Не удалось переслать сообщение "
+            "пользователя %s админу %s: %s",
+            user_id,
+            admin_id,
+            error,
+        )
+
+        await message.answer(
+            "⚠️ Не удалось отправить сообщение "
+            "администратору. Попробуйте ещё раз."
+        )
+
+    return True
+
+
+async def relay_admin_message(
+    message: Message,
+):
+    admin_id = message.from_user.id
+
+    if not await is_admin(admin_id):
+        return False
+
+    ticket = await get_active_admin_ticket(
+        admin_id
     )
+
+    if not ticket:
+        return False
+
+    user_id = ticket["user_id"]
+
+    try:
+        await bot.send_message(
+            user_id,
+            "👨‍💼 <b>Поддержка:</b>",
+        )
+
+        await copy_message_safe(
+            from_chat_id=message.chat.id,
+            to_chat_id=user_id,
+            message_id=message.message_id,
+        )
+
+    except Exception as error:
+        logging.warning(
+            "Не удалось переслать сообщение "
+            "админа %s пользователю %s: %s",
+            admin_id,
+            user_id,
+            error,
+        )
+
+        await message.answer(
+            "⚠️ Не удалось отправить сообщение пользователю."
+        )
+
+    return True
 
 
 # =========================================================
-# STARTUP
+# ALL MESSAGE HANDLER
+# =========================================================
+
+@router.message()
+async def handle_all_messages(
+    message: Message,
+):
+    if not message.from_user:
+        return
+
+    user_id = message.from_user.id
+
+    # -----------------------------------------------------
+    # 1. ADMIN STATE
+    # -----------------------------------------------------
+
+    if await is_admin(user_id):
+        handled = await handle_admin_state(
+            message
+        )
+
+        if handled:
+            return
+
+    # -----------------------------------------------------
+    # 2. PROMO INPUT
+    # -----------------------------------------------------
+
+    if message.text:
+        handled = await handle_promo_input(
+            message
+        )
+
+        if handled:
+            return
+
+    # -----------------------------------------------------
+    # 3. ADMIN TICKET MESSAGE
+    # -----------------------------------------------------
+
+    if await is_admin(user_id):
+        active_ticket = await get_active_admin_ticket(
+            user_id
+        )
+
+        if active_ticket:
+            await relay_admin_message(
+                message
+            )
+            return
+
+    # -----------------------------------------------------
+    # 4. USER TICKET MESSAGE
+    # -----------------------------------------------------
+
+    ticket = await get_open_ticket(
+        user_id
+    )
+
+    if ticket:
+        await relay_user_message(
+            message
+        )
+        return
+
+    # -----------------------------------------------------
+    # 5. DEFAULT
+    # -----------------------------------------------------
+
+    if message.text:
+        await message.answer(
+            "Используйте меню ниже:",
+            reply_markup=kb_main(),
+        )
+
+
+# =========================================================
+# MAIN
 # =========================================================
 
 async def main():
-
     global bot
-
-    await init_db()
 
     logging.basicConfig(
         level=logging.INFO,
@@ -2398,11 +2732,50 @@ async def main():
         ),
     )
 
+    await init_db()
+
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(
             parse_mode=ParseMode.HTML,
         ),
+    )
+
+    # -----------------------------------------------------
+    # IMPORTANT:
+    # Удаляем webhook перед polling.
+    # Это исправляет:
+    #
+    # TelegramConflictError:
+    # can't use getUpdates method while webhook is active
+    # -----------------------------------------------------
+
+    try:
+        await bot.delete_webhook(
+            drop_pending_updates=False
+        )
+
+        logging.info(
+            "Webhook удалён. Запускаем polling."
+        )
+
+    except Exception as error:
+        logging.warning(
+            "Не удалось удалить webhook: %s",
+            error,
+        )
+
+    me = await bot.get_me()
+
+    logging.info(
+        "Бот запущен: @%s id=%s",
+        me.username,
+        me.id,
+    )
+
+    logging.info(
+        "Главный администратор: %s",
+        MAIN_ADMIN_ID,
     )
 
     await dp.start_polling(
