@@ -1099,8 +1099,8 @@ async def cb_other(
     await replace_with(
         call.message,
         "📦 <b>Другие товары</b>\n\n"
-        "• DistroKid - дистрибуция аудио на 1 год\n"
-        "• Подписка на загрузку аудио\n\n"
+        "• DistroKid на 1 год — 1649 рублей\n"
+        "• Подписка на загрузку аудио — 350 рублей в мес.\n\n"
         "Для заказа откройте обращение с менеджером.",
         InlineKeyboardMarkup(
             inline_keyboard=[
