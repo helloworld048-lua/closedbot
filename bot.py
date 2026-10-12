@@ -319,14 +319,24 @@ def kb_admin_ticket(ticket_id, assigned=False):
 
 def kb_admin_panel():
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📨 Обращения", callback_data="admin:tickets")],
+        [InlineKeyboardButton(text="🙋 Взятые обращения", callback_data="admin:tickets:taken")],
         [InlineKeyboardButton(text="💰 Цены", callback_data="admin:prices")],
         [InlineKeyboardButton(text="🎟 Промокоды", callback_data="admin:promos")],
         [InlineKeyboardButton(text="👥 Администраторы", callback_data="admin:admins")],
-        [InlineKeyboardButton(text="📨 Открытые обращения", callback_data="admin:tickets")],
         [InlineKeyboardButton(text="📢 Глобальное объявление", callback_data="admin:announce:global")],
         [InlineKeyboardButton(text="👤 Объявление пользователю", callback_data="admin:announce:user")],
         [InlineKeyboardButton(text="↩️ В меню", callback_data="home")],
     ])
+
+
+def kb_ticket_open(ticket_id, assigned=False):
+    buttons = []
+    if not assigned:
+        buttons.append([InlineKeyboardButton(text="🙋 Взять обращение", callback_data=f"ticket:take:{ticket_id}")])
+    buttons.append([InlineKeyboardButton(text="💬 Открыть", callback_data=f"admin:ticket:open:{ticket_id}")])
+    buttons.append([InlineKeyboardButton(text="🔒 Закрыть", callback_data=f"ticket:close:{ticket_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def kb_price_menu():
@@ -582,12 +592,11 @@ async def open_ticket_for_user(user, reason="support"):
 
     username = f"@{user.username}" if user.username else "без username"
     admin_text = (
-        f"📨 <b>Новое обращение #{ticket['id']}</b>\n\n"
-        f"👤 Пользователь: {user.full_name or 'Без имени'}\n"
-        f"🔗 Username: {username}\n"
-        f"🆔 ID: <code>{user.id}</code>\n\n"
-        f"{intro}\n\n"
-        "Кто первый нажмёт «Взять обращение», тот становится ответственным."
+        f"📨 <b>Обращение #{ticket['id']}</b>\n\n"
+        f"Обращение от: {escape(user.full_name or 'Без имени')}\n"
+        f"Username: {escape(username)}\n"
+        f"ID: <code>{user.id}</code>\n\n"
+        f"{intro}"
     )
 
     for admin_id in await get_admin_ids():
@@ -595,7 +604,7 @@ async def open_ticket_for_user(user, reason="support"):
             await bot.send_message(
                 admin_id,
                 admin_text,
-                reply_markup=kb_admin_ticket(ticket["id"]),
+                reply_markup=kb_ticket_open(ticket["id"]),
             )
         except Exception as e:
             logging.warning("Cannot notify admin %s: %s", admin_id, e)
@@ -644,30 +653,34 @@ async def cb_user_close(call: CallbackQuery):
 
 
 async def relay_user_message(message: Message, ticket):
-    assigned = ticket["assigned_admin"]
-    if not assigned:
-        await message.answer(
-            "⏳ Обращение ещё никто не взял.\n"
-            "Сообщение сохранено. Дождитесь администратора.",
-        )
-        return
-
+    # Сообщение пользователя уведомляет всех администраторов и содержит кнопку
+    # перехода в конкретное обращение. Это позволяет вести несколько обращений параллельно.
     username = f"@{message.from_user.username}" if message.from_user.username else "без username"
-    await bot.send_message(
-        assigned,
-        f"👤 <b>Сообщение пользователя</b>\n"
+    notice = (
+        f"📨 <b>В обращении от: {escape(message.from_user.full_name or 'Без имени')}</b>\n"
         f"Обращение: <b>#{ticket['id']}</b>\n"
-        f"Имя: {message.from_user.full_name or 'Без имени'}\n"
-        f"Username: {username}\n"
+        f"Username: {escape(username)}\n"
         f"ID: <code>{message.from_user.id}</code>\n\n"
-        "Сообщение:",
+        "Пришло сообщение."
     )
-    await copy_message_safe(
-        bot,
-        message.chat.id,
-        assigned,
-        message.message_id,
-    )
+    recipient_ids = set(await get_admin_ids())
+    if ticket["assigned_admin"]:
+        recipient_ids.add(int(ticket["assigned_admin"]))
+    for admin_id in recipient_ids:
+        try:
+            await bot.send_message(
+                admin_id,
+                notice,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="Открыть", callback_data=f"admin:ticket:open:{ticket['id']}")]
+                ]),
+            )
+            await copy_message_safe(bot, message.chat.id, admin_id, message.message_id)
+        except Exception as e:
+            logging.warning("Cannot relay ticket message to admin %s: %s", admin_id, e)
+
+    if not ticket["assigned_admin"]:
+        await message.answer("⏳ Сообщение передано администраторам. Ожидайте, пока кто-нибудь возьмёт обращение.")
 
 
 async def copy_message_safe(bot_obj, from_chat_id, to_chat_id, message_id):
@@ -752,11 +765,15 @@ async def cb_take_ticket(call: CallbackQuery):
         await call.answer("Это обращение уже взял другой администратор.", show_alert=True)
         return
 
+    await db_execute(
+        "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
+        (f"active_ticket:{call.from_user.id}", str(ticket_id)),
+    )
     await call.answer("Обращение взято.")
     try:
         await call.message.edit_text(
             call.message.text + "\n\n✅ <b>Взято вами.</b>",
-            reply_markup=kb_admin_ticket(ticket_id, assigned=True),
+            reply_markup=kb_ticket_open(ticket_id, assigned=True),
         )
     except TelegramBadRequest:
         pass
@@ -1009,36 +1026,87 @@ async def cb_admin_tickets(call: CallbackQuery):
     if not await is_admin(call.from_user.id):
         await call.answer("Нет доступа.", show_alert=True)
         return
-
     rows = await db_execute(
-        "SELECT * FROM tickets WHERE status='open' ORDER BY id DESC LIMIT 30",
+        "SELECT * FROM tickets WHERE status='open' ORDER BY id DESC LIMIT 50",
         fetch=True,
     )
-    if not rows:
-        text = "📨 Открытых обращений нет."
-    else:
-        lines = ["📨 <b>Открытые обращения</b>\n"]
-        for r in rows:
-            assigned = f"админ <code>{r['assigned_admin']}</code>" if r["assigned_admin"] else "ожидает администратора"
-            name = r["full_name"] if "full_name" in r.keys() else ""
-            username = r["username"] if r["username"] else "без username"
-            username = f"@{username}" if username != "без username" else username
-            lines.append(
-                f"#{r['id']} — {assigned}\n"
-                f"👤 {name or 'Без имени'}\n"
-                f"🔗 {username}\n"
-                f"🆔 <code>{r['user_id']}</code>"
-            )
-        text = "\n".join(lines)
-
+    buttons = []
+    for r in rows:
+        name = escape(r["full_name"] or "Без имени")
+        state = f"взял {r['assigned_admin']}" if r["assigned_admin"] else "не взято"
+        buttons.append([InlineKeyboardButton(
+            text=f"#{r['id']} · {name[:28]} · {state}",
+            callback_data=f"admin:ticket:open:{r['id']}"
+        )])
+    buttons.append([InlineKeyboardButton(text="🙋 Взятые обращения", callback_data="admin:tickets:taken")])
+    buttons.append([InlineKeyboardButton(text="↩️ Назад", callback_data="admin:panel")])
+    text = "📨 <b>Все открытые обращения</b>\n\nВыберите обращение:" if rows else "📨 Открытых обращений нет."
     await call.answer()
-    await replace_with(
-        call.message,
-        text,
-        InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="↩️ Назад", callback_data="admin:panel")]
-        ]),
+    await replace_with(call.message, text, InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data == "admin:tickets:taken")
+async def cb_admin_taken_tickets(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    rows = await db_execute(
+        "SELECT * FROM tickets WHERE status='open' AND assigned_admin=? ORDER BY id DESC LIMIT 50",
+        (call.from_user.id,), fetch=True,
     )
+    buttons = []
+    for r in rows:
+        name = escape(r["full_name"] or "Без имени")
+        buttons.append([InlineKeyboardButton(
+            text=f"#{r['id']} · {name[:35]}",
+            callback_data=f"admin:ticket:open:{r['id']}"
+        )])
+    buttons.append([InlineKeyboardButton(text="📨 Все обращения", callback_data="admin:tickets")])
+    buttons.append([InlineKeyboardButton(text="↩️ Назад", callback_data="admin:panel")])
+    text = "🙋 <b>Взятые вами обращения</b>\n\nВыберите чат:" if rows else "🙋 У вас пока нет взятых обращений."
+    await call.answer()
+    await replace_with(call.message, text, InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@router.callback_query(F.data.startswith("admin:ticket:open:"))
+async def cb_admin_open_ticket(call: CallbackQuery):
+    if not await is_admin(call.from_user.id):
+        await call.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        ticket_id = int(call.data.rsplit(":", 1)[1])
+    except ValueError:
+        await call.answer("Некорректный номер обращения.", show_alert=True)
+        return
+    ticket = await get_ticket(ticket_id)
+    if not ticket or ticket["status"] != "open":
+        await call.answer("Обращение закрыто или не найдено.", show_alert=True)
+        return
+    assigned = ticket["assigned_admin"]
+    if assigned and int(assigned) != call.from_user.id and not await is_main_admin(call.from_user.id):
+        await call.answer(f"Обращение уже взял администратор {assigned}.", show_alert=True)
+        return
+    await db_execute(
+        "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
+        (f"active_ticket:{call.from_user.id}", str(ticket_id)),
+    )
+    username = f"@{ticket['username']}" if ticket["username"] else "без username"
+    text = (
+        f"💬 <b>Обращение #{ticket_id}</b>\n\n"
+        f"От: {escape(ticket['full_name'] or 'Без имени')}\n"
+        f"Username: {escape(username)}\n"
+        f"ID: <code>{ticket['user_id']}</code>\n"
+        f"Статус: {'взято вами' if assigned == call.from_user.id else ('взято администратором ' + str(assigned) if assigned else 'ожидает администратора')}\n\n"
+        "Теперь ваши сообщения будут отправляться в этот чат. Чтобы переключиться на другое обращение, нажмите его кнопку «Открыть»."
+    )
+    buttons = []
+    if not assigned:
+        buttons.append([InlineKeyboardButton(text="🙋 Взять обращение", callback_data=f"ticket:take:{ticket_id}")])
+    buttons.append([InlineKeyboardButton(text="🔒 Закрыть обращение", callback_data=f"ticket:close:{ticket_id}")])
+    buttons.append([InlineKeyboardButton(text="📨 Все обращения", callback_data="admin:tickets")])
+    buttons.append([InlineKeyboardButton(text="🙋 Взятые обращения", callback_data="admin:tickets:taken")])
+    await call.answer("Чат выбран.")
+    await replace_with(call.message, text, InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
 # -------------------- Admin text state --------------------
@@ -1066,25 +1134,16 @@ async def handle_admin_text(message: Message) -> bool:
 
     if not state:
         # Admin chat relay: any message type can be forwarded.
-        open_rows = await db_execute(
-            "SELECT * FROM tickets WHERE status='open' AND assigned_admin=? "
-            "ORDER BY id DESC LIMIT 1",
-            (user_id,),
-            fetch=True,
+        active = await db_execute(
+            "SELECT value FROM settings WHERE key=?",
+            (f"active_ticket:{user_id}",), fetchone=True,
         )
-        if open_rows:
-            ticket = open_rows[0]
-            await bot.send_message(
-                ticket["user_id"],
-                "👨‍💼 <b>Администратор:</b>",
-            )
-            await copy_message_safe(
-                bot,
-                user_id,
-                ticket["user_id"],
-                message.message_id,
-            )
-            return True
+        if active:
+            ticket = await get_ticket(int(active["value"]))
+            if ticket and ticket["status"] == "open" and ticket["assigned_admin"] == user_id:
+                await bot.send_message(ticket["user_id"], "👨‍💼 <b>Администратор:</b>")
+                await copy_message_safe(bot, user_id, ticket["user_id"], message.message_id)
+                return True
         return False
 
     key = state["key"]
@@ -1108,7 +1167,10 @@ async def handle_admin_text(message: Message) -> bool:
                 (username,), fetchone=True,
             )
             if not found:
-                await message.answer("❌ Username не найден. Проверьте написание или попросите пользователя запустить бота через /start.")
+                await message.answer(
+                    "❌ Этого username нет в базе бота. Telegram не позволяет боту находить личный чат любого человека только по @username.\n\n"
+                    "Укажите числовой Telegram ID пользователя. Если его нет, попросите пользователя открыть бота и нажать /start, затем повторите отправку."
+                )
                 return True
             target = int(found["user_id"])
 
