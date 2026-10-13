@@ -1,12 +1,16 @@
 import asyncio
 import logging
 import os
+import re
+import time
+from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 
 import aiosqlite
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
@@ -101,6 +105,14 @@ async def init_db():
             full_name TEXT,
             last_seen TEXT DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS banned_users (
+            user_id INTEGER PRIMARY KEY,
+            reason TEXT NOT NULL,
+            banned_until INTEGER NOT NULL,
+            created_by INTEGER NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
         """)
 
         # Миграция старой базы: добавляем новые поля тикетов, если их ещё нет.
@@ -145,6 +157,32 @@ async def init_db():
                 "INSERT OR IGNORE INTO admins(user_id, is_main) VALUES (?, 0)",
                 (int(value),),
             )
+
+
+class BanMiddleware(BaseMiddleware):
+    """Silently drops every update from users with an active ban."""
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if user is not None:
+            row = await db_execute(
+                "SELECT banned_until FROM banned_users WHERE user_id=?",
+                (user.id,), fetchone=True,
+            )
+            if row:
+                if int(row["banned_until"]) > int(time.time()):
+                    if isinstance(event, CallbackQuery):
+                        try:
+                            await event.answer()
+                        except Exception:
+                            pass
+                    return None
+                await db_execute("DELETE FROM banned_users WHERE user_id=?", (user.id,))
+        return await handler(event, data)
+
+
+ban_middleware = BanMiddleware()
+router.message.outer_middleware(ban_middleware)
+router.callback_query.outer_middleware(ban_middleware)
 
 
 async def is_admin(user_id: int) -> bool:
@@ -353,6 +391,9 @@ def kb_admins_menu():
         [InlineKeyboardButton(text="➕ Выдать админа", callback_data="admin:add")],
         [InlineKeyboardButton(text="➖ Снять админа", callback_data="admin:remove")],
         [InlineKeyboardButton(text="📋 Список админов", callback_data="admin:list")],
+        [InlineKeyboardButton(text="🚫 Временный бан по ID", callback_data="admin:ban:add")],
+        [InlineKeyboardButton(text="🔓 Снять бан по ID", callback_data="admin:ban:remove")],
+        [InlineKeyboardButton(text="📋 Список банов", callback_data="admin:ban:list")],
         [InlineKeyboardButton(text="↩️ Назад", callback_data="admin:panel")],
     ])
 
@@ -893,6 +934,63 @@ async def cb_admin_admins(call: CallbackQuery):
     await replace_with(call.message, "👥 <b>Администраторы</b>", kb_admins_menu())
 
 
+@router.callback_query(F.data == "admin:ban:add")
+async def cb_admin_ban_add(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id):
+        await call.answer("Только главный администратор.", show_alert=True)
+        return
+    await db_execute(
+        "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
+        (f"awaiting_ban_user_id:{call.from_user.id}", "1"),
+    )
+    await call.answer()
+    await replace_with(
+        call.message,
+        "🚫 <b>Временный бан</b>\n\nОтправьте числовой Telegram ID пользователя.\nБан блокирует все команды, сообщения и кнопки, включая /start.",
+        kb_admins_menu(),
+    )
+
+
+@router.callback_query(F.data == "admin:ban:remove")
+async def cb_admin_ban_remove(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id):
+        await call.answer("Только главный администратор.", show_alert=True)
+        return
+    await db_execute(
+        "INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
+        (f"awaiting_ban_remove:{call.from_user.id}", "1"),
+    )
+    await call.answer()
+    await replace_with(
+        call.message,
+        "🔓 <b>Снять бан</b>\n\nОтправьте Telegram ID пользователя.",
+        kb_admins_menu(),
+    )
+
+
+@router.callback_query(F.data == "admin:ban:list")
+async def cb_admin_ban_list(call: CallbackQuery):
+    if not await is_main_admin(call.from_user.id):
+        await call.answer("Только главный администратор.", show_alert=True)
+        return
+    rows = await db_execute(
+        "SELECT user_id, reason, banned_until, created_by FROM banned_users ORDER BY banned_until",
+        fetch=True,
+    )
+    now = int(time.time())
+    lines = ["📋 <b>Активные баны</b>\n"]
+    active = [r for r in rows if int(r["banned_until"]) > now]
+    if not active:
+        lines.append("Активных банов нет.")
+    for row in active:
+        until = datetime.fromtimestamp(int(row["banned_until"]), timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+        lines.append(
+            f"ID: <code>{row['user_id']}</code>\nПричина: {escape(row['reason'])}\nДо: <b>{until}</b>\n"
+        )
+    await call.answer()
+    await replace_with(call.message, "\n".join(lines), kb_admins_menu())
+
+
 @router.callback_query(F.data == "admin:list")
 async def cb_admin_list(call: CallbackQuery):
     if not await is_main_admin(call.from_user.id):
@@ -1116,9 +1214,24 @@ async def handle_admin_text(message: Message) -> bool:
     if not await is_admin(user_id):
         return False
 
+    # Ban removal is a separate one-step workflow.
+    remove_ban_state = await db_execute(
+        "SELECT value FROM settings WHERE key=?",
+        (f"awaiting_ban_remove:{user_id}",), fetchone=True,
+    )
+    if remove_ban_state:
+        if not message.text or not message.text.strip().isdigit():
+            await message.answer("❌ Отправьте числовой Telegram ID.")
+            return True
+        target = int(message.text.strip())
+        await db_execute("DELETE FROM banned_users WHERE user_id=?", (target,))
+        await db_execute("DELETE FROM settings WHERE key=?", (f"awaiting_ban_remove:{user_id}",))
+        await message.answer(f"🔓 Бан для <code>{target}</code> снят, если он был активен.", reply_markup=kb_admins_menu())
+        return True
+
     # Main admin: add/remove admin.
     state = await db_execute(
-        "SELECT key FROM settings WHERE key IN (?, ?, ?, ?, ?, ?, ?, ?) LIMIT 1",
+        "SELECT key FROM settings WHERE key IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) LIMIT 1",
         (
             f"awaiting_admin_add:{user_id}",
             f"awaiting_admin_remove:{user_id}",
@@ -1128,6 +1241,9 @@ async def handle_admin_text(message: Message) -> bool:
             f"awaiting_announce_global:{user_id}",
             f"awaiting_announce_user_target:{user_id}",
             f"awaiting_announce_user_text:{user_id}",
+            f"awaiting_ban_user_id:{user_id}",
+            f"awaiting_ban_reason:{user_id}",
+            f"awaiting_ban_duration:{user_id}",
         ),
         fetchone=True,
     )
@@ -1147,6 +1263,72 @@ async def handle_admin_text(message: Message) -> bool:
         return False
 
     key = state["key"]
+
+    if key == f"awaiting_ban_user_id:{user_id}":
+        if not message.text or not message.text.strip().isdigit():
+            await message.answer("❌ Отправьте числовой Telegram ID.")
+            return True
+        target = int(message.text.strip())
+        if target <= 0:
+            await message.answer("❌ Некорректный Telegram ID.")
+            return True
+        if target == MAIN_ADMIN_ID or await is_admin(target):
+            await message.answer("❌ Нельзя заблокировать главного администратора или администратора.", reply_markup=kb_admins_menu())
+            await db_execute("DELETE FROM settings WHERE key=?", (key,))
+            return True
+        await db_execute("DELETE FROM settings WHERE key=?", (key,))
+        await db_execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (f"awaiting_ban_reason:{user_id}", str(target)))
+        await message.answer(f"ID пользователя: <code>{target}</code>\n\nТеперь отправьте причину бана.")
+        return True
+
+    if key == f"awaiting_ban_reason:{user_id}":
+        if not message.text or not message.text.strip():
+            await message.answer("❌ Напишите причину бана.")
+            return True
+        target = int(key_value := (await db_execute("SELECT value FROM settings WHERE key=?", (key,), fetchone=True))["value"])
+        reason = message.text.strip()[:500]
+        await db_execute("DELETE FROM settings WHERE key=?", (key,))
+        await db_execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (f"awaiting_ban_duration:{user_id}", f"{target}|{reason}"))
+        await message.answer(
+            "⏱ <b>Срок бана</b>\n\nУкажите длительность: число и единица времени.\n"
+            "Примеры: <code>30m</code> (минут), <code>2h</code> (часа), <code>7d</code> (дней).\n"
+            "Максимум: 365d."
+        )
+        return True
+
+    if key == f"awaiting_ban_duration:{user_id}":
+        if not message.text or not message.text.strip():
+            await message.answer("❌ Укажите срок, например 2h или 7d.")
+            return True
+        match = re.fullmatch(r"([1-9]\d{0,4})(m|h|d)", message.text.strip().lower())
+        if not match:
+            await message.answer("❌ Формат срока: 30m, 2h или 7d. Максимум 365d.")
+            return True
+        amount, unit = int(match.group(1)), match.group(2)
+        seconds = amount * {"m": 60, "h": 3600, "d": 86400}[unit]
+        if seconds > 365 * 86400:
+            await message.answer("❌ Максимальный срок бана - 365d.")
+            return True
+        state_row = await db_execute("SELECT value FROM settings WHERE key=?", (key,), fetchone=True)
+        if not state_row:
+            await message.answer("❌ Сессия бана не найдена. Начните заново.", reply_markup=kb_admins_menu())
+            return True
+        target_text, reason = state_row["value"].split("|", 1)
+        target = int(target_text)
+        until_ts = int(time.time()) + seconds
+        await db_execute(
+            "INSERT OR REPLACE INTO banned_users(user_id, reason, banned_until, created_by) VALUES (?, ?, ?, ?)",
+            (target, reason, until_ts, user_id),
+        )
+        await db_execute("DELETE FROM settings WHERE key=?", (key,))
+        until = datetime.fromtimestamp(until_ts, timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+        await message.answer(
+            f"🚫 <b>Пользователь заблокирован</b>\n\nID: <code>{target}</code>\n"
+            f"Причина: {escape(reason)}\nСрок: <b>{amount}{unit}</b>\nДо: <b>{until}</b>\n\n"
+            "Все сообщения, команды и нажатия кнопок, включая /start, будут игнорироваться до окончания бана.",
+            reply_markup=kb_admins_menu(),
+        )
+        return True
 
     if key == f"awaiting_announce_user_target:{user_id}":
         if not message.text or not message.text.strip():
